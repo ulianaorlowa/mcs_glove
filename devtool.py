@@ -6,6 +6,34 @@ devtool.py — MCS Glove developer / diagnostic tool (Russian UI).
 Requires devclient.py and: pip install PySide6 bleak.  No safety cap.
 """
 
+# ---- crash logger: must stay above all other imports ----
+import os
+import sys
+from pathlib import Path
+
+
+def _install_crash_log() -> None:
+    """Write uncaught exceptions to %APPDATA%\\MCS Glove\\crash.log.
+    Needed for --windowed builds, which have no console to print to."""
+    log_dir = Path(os.environ.get("APPDATA") or Path.home()) / "MCS Glove"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "crash.log"
+
+    def _hook(exc_type, exc, tb):
+        import datetime
+        import traceback
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n=== {datetime.datetime.now()} ===\n")
+            traceback.print_exception(exc_type, exc, tb, file=f)
+        if sys.__stderr__ is not None:
+            sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+_install_crash_log()
+# ---- end crash logger ----
+
 import sys
 import threading
 import time
@@ -25,13 +53,29 @@ from PySide6.QtGui import QColor
 
 from bleak import BleakClient, BleakScanner
 
-from devclient import DebugClient
+from devclient import DebugClient, RTP_ZERO, pct_to_rtp
 
 DEVICE_NAME  = "MCS Glove"
 NUM_CHANNELS = 8
 RSENSE_MOHM  = 10.0
 
-SETTINGS_FILE = "mcs_glove_last_settings.json"
+# Everything that talks to the glove is locked until the BLE link is up.
+# OTA is deliberately NOT locked by default: if the application firmware is
+# broken the device advertises as AppLoader ("OTA"/"Apploader") and the normal
+# connect will never succeed — gating OTA would remove the only recovery path.
+# Set to True if you want the whole window dead until connected.
+OTA_REQUIRES_CONNECTION = False
+
+def data_dir() -> Path:
+    """Writable per-user location. Never write next to the exe: --onefile
+    unpacks to a temp dir that is wiped on exit, and Program Files is
+    read-only for a standard user."""
+    d = Path(os.environ.get("APPDATA") or Path.home()) / "MCS Glove"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+SETTINGS_FILE = str(data_dir() / "mcs_glove_last_settings.json")
 
 # OTA 
 OTA_SERVICE_UUID = "1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0"
@@ -71,8 +115,12 @@ QPushButton:hover { background:#F1EFE8; }
 QPushButton:disabled { color:#B4B2A9; border-color:#E4E2DA; }
 QPushButton#run { background:#2AA67B; color:#FFFFFF; border:none; }
 QPushButton#run:hover { background:#24906A; }
-QPushButton#stopAll { background:#A32D2D; color:#FFFFFF; border:none; font-weight:500; }
+QPushButton#stopAll {
+    background:#A32D2D; color:#FFFFFF; border:none; border-radius:8px;
+    font-size:17px; font-weight:600; letter-spacing:1px;
+}
 QPushButton#stopAll:hover { background:#922828; }
+QPushButton#stopAll:disabled { background:#D6CFCB; color:#F3F1EC; }
 QComboBox { background:#FFFFFF; border:1px solid #D8D6CC; border-radius:6px; padding:3px 6px; }
 QSpinBox {
     background:#FFFFFF; border:1px solid #D8D6CC; border-radius:6px;
@@ -814,11 +862,16 @@ class OtaDialog(QDialog):
 class DevTool(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.resize(1280, 860)
+        self.setMinimumSize(1150, 700)
         self.setWindowTitle("MCS Glove — Утилита для тестирования")
         self.dbg = DebugClient()
 
         self.bridge = Bridge()
         self.dbg.on_status = self.bridge.status.emit
+        # Fired by bleak on its loop thread; the signal queues _on_connected
+        # onto the GUI thread
+        self.dbg.on_disconnect = lambda: self.bridge.connected.emit(False)
         self.bridge.status.connect(self._log)
         self.bridge.connected.connect(self._on_connected)
         self.bridge.health.connect(self._set_health)
@@ -831,6 +884,10 @@ class DevTool(QMainWindow):
         
         self.rows = {}
         self._dev_address = None
+        self._connected = False        # single source of truth for UI gating;
+                                       # read by _mode_changed, set in _on_connected
+        self._manual_disconnect = False  # True while WE drop the link, so it
+                                         # isn't logged as a lost connection
         self.batt_labels = {}
         self._cycle_stop = threading.Event()
         self._cycle_thread = None
@@ -844,6 +901,12 @@ class DevTool(QMainWindow):
         self._batt_timer.setInterval(5000)
         self._batt_timer.timeout.connect(self._poll_battery)
         self._batt_timer.start()
+
+        # Fallback for backends where bleak's disconnect callback doesn't fire
+        self._link_timer = QTimer(self)
+        self._link_timer.setInterval(2000)
+        self._link_timer.timeout.connect(self._check_link)
+        self._link_timer.start()
 
     def _build_ui(self):
         root = QWidget()
@@ -869,7 +932,6 @@ class DevTool(QMainWindow):
         top.addWidget(self.conn_label)
         top.addWidget(self.dev_label, 1)
         top.addWidget(self.ota_btn)
-        top.addWidget(self.stop_all_btn)
         outer.addLayout(top)
 
         # Main area
@@ -885,16 +947,17 @@ class DevTool(QMainWindow):
         self.run_sel_btn.setObjectName("run")
         self.run_sel_btn.clicked.connect(self._run_selected)
 
-        load_btn = QPushButton("Загрузить последние")
-        load_btn.clicked.connect(self._load_settings)
-        reset_btn = QPushButton("Сбросить к базовым")
-        reset_btn.clicked.connect(self._reset_to_defaults)
-        diag_btn = QPushButton("Диагностика драйверов")
-        diag_btn.clicked.connect(self._open_diagnostics)
+        self.load_btn = QPushButton("Загрузить последние")
+        self.load_btn.clicked.connect(self._load_settings)
+        self.reset_btn = QPushButton("Сбросить к базовым")
+        self.reset_btn.clicked.connect(self._reset_to_defaults)
+        self.diag_btn = QPushButton("Диагностика драйверов")
+        self.diag_btn.clicked.connect(self._open_diagnostics)
+        # Offline reference table — no BLE traffic, stays available always.
         effects_btn = QPushButton("Список эффектов")
         effects_btn.clicked.connect(self._show_effects)
 
-        for b in (self.run_sel_btn, load_btn, reset_btn, diag_btn):
+        for b in (self.run_sel_btn, self.load_btn, self.reset_btn, self.diag_btn):
             controls_row.addWidget(b)
         controls_row.addStretch()
         controls_row.addWidget(effects_btn)
@@ -905,15 +968,15 @@ class DevTool(QMainWindow):
         self.cycle_start_btn = QPushButton("Старт цикла")
         self.cycle_start_btn.setObjectName("run")
         self.cycle_stop_btn  = QPushButton("Стоп цикла")
-        cyc_set_btn = QPushButton("Настройки цикла")
+        self.cyc_set_btn = QPushButton("Настройки цикла")
         self.cycle_start_btn.clicked.connect(self._cycle_start)
         self.cycle_stop_btn.clicked.connect(self._cycle_stop_req)
-        cyc_set_btn.clicked.connect(self._edit_cycle_settings)
+        self.cyc_set_btn.clicked.connect(self._edit_cycle_settings)
 
         cyc_lab = QLabel("Цикл:")
         cyc_lab.setStyleSheet("color:#6B6A63;")
         cycle_row.addWidget(cyc_lab)
-        for b in (self.cycle_start_btn, self.cycle_stop_btn, cyc_set_btn):
+        for b in (self.cycle_start_btn, self.cycle_stop_btn, self.cyc_set_btn):
             cycle_row.addWidget(b)
         cycle_row.addStretch()
         left.addLayout(cycle_row)
@@ -963,8 +1026,9 @@ class DevTool(QMainWindow):
 
             self._mode_changed(ch)
 
-        for col, s in enumerate([0, 2, 2, 1, 3, 3, 3, 1, 0, 2]):
-            grid.setColumnStretch(col, s)
+        for col in range(len(headers)):
+            grid.setColumnStretch(col, 0)
+        grid.setColumnStretch(len(headers), 1)   # all slack to the right of «Состояние»
         left.addWidget(box)
 
         # === Общие параметры для всех каналов ===
@@ -995,15 +1059,15 @@ class DevTool(QMainWindow):
             ag.addWidget(wdg, 1, col)
 
         # row 2: buttons
-        apply_all_btn = QPushButton("Применить ко всем")
-        apply_all_btn.setObjectName("run")
-        apply_sel_btn = QPushButton("Применить к выбранным")
-        apply_all_btn.clicked.connect(lambda: self._apply_common(False))
-        apply_sel_btn.clicked.connect(lambda: self._apply_common(True))
+        self.apply_all_btn = QPushButton("Применить ко всем")
+        self.apply_all_btn.setObjectName("run")
+        self.apply_sel_btn = QPushButton("Применить к выбранным")
+        self.apply_all_btn.clicked.connect(lambda: self._apply_common(False))
+        self.apply_sel_btn.clicked.connect(lambda: self._apply_common(True))
 
         btn_row = QHBoxLayout()
-        btn_row.addWidget(apply_all_btn)
-        btn_row.addWidget(apply_sel_btn)
+        btn_row.addWidget(self.apply_all_btn)
+        btn_row.addWidget(self.apply_sel_btn)
         btn_row.addStretch()
         ag.addLayout(btn_row, 2, 0, 1, len(fields))
 
@@ -1031,30 +1095,50 @@ class DevTool(QMainWindow):
         bwrap.addWidget(bbox)
         bwrap.addStretch()
         split.addLayout(bwrap, 0)
-        split.addStretch(1)
 
-        outer.addLayout(split)
+        outer.addLayout(split, 1)
 
-        self.log = QTextEdit(); 
-        self.log.setReadOnly(True); 
-        self.log.setMinimumHeight(80)
-        outer.addWidget(self.log)
-
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(90)
+        self.log.setMaximumHeight(200)
+        outer.addWidget(self.log, 0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setWidget(root)
-        self.setCentralWidget(scroll)
+
+        # СТОП sits OUTSIDE the scroll area so it stays pinned to the window
+        # bottom — inside `outer` it would scroll away with the content.
+        self.stop_all_btn.setMinimumSize(240, 64)
+        self.stop_all_btn.setShortcut("Esc")
+        self.stop_all_btn.setToolTip("Остановить все моторы (Esc)")
+
+        stop_bar = QHBoxLayout()
+        stop_bar.addStretch(1)                 # keeps the button hard right
+        stop_bar.addWidget(self.stop_all_btn)
+
+        central = QWidget()
+        v = QVBoxLayout(central)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
+        v.addWidget(scroll, 1)
+        v.addLayout(stop_bar, 0)
+        self.setCentralWidget(central)
 
     def _mode_changed(self, ch):
+        """Per-row field availability = connection AND mode.
+        Without the connection term this would silently re-enable the fields
+        every time a mode combo changes while the glove is offline."""
         w = self.rows[ch]
         m = w["mode"].currentText()
+        on = self._connected
         is_rtp = (m == M_RTP)
         is_lib = (m == M_LIB)
 
         for k in ("power", "dur", "up", "down"):
-            w[k].setEnabled(is_rtp)
-        w["eff"].setEnabled(is_lib)
+            w[k].setEnabled(on and is_rtp)
+        w["eff"].setEnabled(on and is_lib)
 
     # ---- connection ----
     def _do_connect(self):
@@ -1073,23 +1157,71 @@ class DevTool(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _do_disconnect(self):
+        self._cycle_stop.set()          # a running cycle must not outlive the link
+        self._manual_disconnect = True
         self.dbg.disconnect()
         self.bridge.connected.emit(False)
 
+    def _check_link(self):
+        """Catches a dropped link when on_disconnect didn't fire.
+        Cheap: reads bleak's cached flag, no BLE traffic."""
+        if self._connected and not self.dbg.connected:
+            self.bridge.connected.emit(False)
+
+    def _require_connection(self):
+        """Second line of defence. The widgets are disabled, but a command can
+        still arrive from a keyboard shortcut, a queued signal, or a link that
+        dropped between the click and the worker thread starting."""
+        if self.dbg.connected:
+            return True
+        self._log("Устройство не подключено — команда не отправлена")
+        return False
+
     def _on_connected(self, ok):
+        ok = bool(ok)
+        was = self._connected
+        self._connected = ok
+
+        if not ok:
+            self._cycle_stop.set()      # a running cycle must not outlive the link
+            if was and not self._manual_disconnect:
+                self._log("Связь с устройством потеряна")
+        self._manual_disconnect = False
+
+        # --- connection bar ---
         self.connect_btn.setEnabled(not ok)
         self.disconnect_btn.setEnabled(ok)
-        self.stop_all_btn.setEnabled(ok)
-        self.run_sel_btn.setEnabled(ok)
         self.conn_label.setText("Подключено" if ok else "Не подключено")
-        self.cycle_start_btn.setEnabled(ok)
-        self.cycle_stop_btn.setEnabled(False)
+        if OTA_REQUIRES_CONNECTION:
+            self.ota_btn.setEnabled(ok)
 
-        for w in self.rows.values():
-            w["run"].setEnabled(ok)
+        # --- everything that generates BLE traffic ---
+        for btn in (self.stop_all_btn, self.run_sel_btn, self.load_btn,
+                    self.reset_btn, self.diag_btn, self.cycle_start_btn,
+                    self.cyc_set_btn, self.apply_all_btn, self.apply_sel_btn):
+            btn.setEnabled(ok)
+        self.cycle_stop_btn.setEnabled(False)   # enabled only by _cycle_start
+
+        # --- per-channel rows ---
+        for ch, w in self.rows.items():
+            for key in ("sel", "mode", "run"):
+                w[key].setEnabled(ok)
+            if not ok:
+                w["sel"].setChecked(False)
+            self._mode_changed(ch)      # power/dur/up/down/eff follow mode+link
+
+        # --- common parameters block ---
+        for wdg in (self.all_mode, self.all_power, self.all_dur,
+                    self.all_up, self.all_down, self.all_eff):
+            wdg.setEnabled(ok)
+
         if not ok:
             for lab in self.batt_labels.values():
                 lab.setText("—")
+            for w in self.rows.values():        # stale health is worse than none
+                w["health"].setText("—")
+                w["health"].setToolTip("")
+                w["health"].setStyleSheet(f"color:{GREY};")
 
     def _show_devinfo(self, info):
         if not info:
@@ -1128,6 +1260,8 @@ class DevTool(QMainWindow):
 
     # ---- run (branches by mode) ----
     def _run(self, ch):
+        if not self._require_connection():
+            return
         w = self.rows[ch]
         m = w["mode"].currentText()
         w["run"].setEnabled(False)
@@ -1146,7 +1280,7 @@ class DevTool(QMainWindow):
             except Exception as e:
                 self.bridge.status.emit(f"CH{ch}: ошибка: {e}")
                 try:
-                    self.dbg.write_reg(ch, REG_RTP, 0)
+                    self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
                     self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
                 except Exception:
                     pass
@@ -1161,15 +1295,14 @@ class DevTool(QMainWindow):
         power, dur, up, down = (w["power"].value(), w["dur"].value_ms(),
                                 w["up"].value_ms(), w["down"].value_ms())
         self._log(f"CH{ch} ({designator(ch)}): RTP {power}% {dur} мс")
-        target = power * 255 // 100
+        target = pct_to_rtp(power)
         self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
         self.dbg.read_reg(ch, REG_STATUS)              # clear stale latch
-        self._ramp(ch, 0, target, up)
+        self._ramp(ch, RTP_ZERO, target, up)
         if dur > 0:
-            self.dbg.write_reg(ch, REG_RTP, target)
-            time.sleep(dur / 1000.0)
-        self._ramp(ch, target, 0, down)
-        self.dbg.write_reg(ch, REG_RTP, 0)
+            target = self._hold_live(ch, target, dur)
+        self._ramp(ch, target, RTP_ZERO, down)
+        self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
         self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
         self._emit_run_health(ch, self.dbg.read_reg(ch, REG_STATUS))
 
@@ -1207,6 +1340,7 @@ class DevTool(QMainWindow):
             self._log("Цикл остановлен перед прошивкой")
         if self.dbg.connected:
             self._log("Отключение перед прошивкой...")
+            self._manual_disconnect = True
             try:
                 self.dbg.disconnect()
             except Exception:
@@ -1239,7 +1373,26 @@ class DevTool(QMainWindow):
             self.dbg.write_reg(ch, REG_RTP, start + (end - start) * i // steps)
             time.sleep(ms / 1000.0 / steps)
 
+    def _hold_live(self, ch, target, dur_ms):
+        """Hold for dur_ms while re-reading the power spinbox, so the amplitude
+        can be changed while the motor is running. Returns the value last
+        written — the ramp-down has to start from there, not from the original
+        target, or it steps discontinuously."""
+        w = self.rows[ch]
+        self.dbg.write_reg(ch, REG_RTP, target)
+        end = time.time() + dur_ms / 1000.0
+        sent = target
+        while time.time() < end:
+            time.sleep(min(0.05, max(0.0, end - time.time())))
+            want = pct_to_rtp(w["power"].value())
+            if abs(want - sent) >= 4:          # ~3 % of the 127-wide span
+                self.dbg.write_reg_fast(ch, REG_RTP, want)
+                sent = want
+        return sent
+
     def _run_selected(self):
+        if not self._require_connection():
+            return
         chans = [ch for ch, w in self.rows.items() if w["sel"].isChecked()]
         if not chans:
             self._log("Не выбрано ни одного мотора")
@@ -1250,6 +1403,8 @@ class DevTool(QMainWindow):
 
     # ---- cycling ----
     def _cycle_start(self):
+        if not self._require_connection():
+            return
         chans = [ch for ch, w in self.rows.items() if w["sel"].isChecked()]
         if not chans:
             self._log("Не выбрано ни одного мотора")
@@ -1324,7 +1479,7 @@ class DevTool(QMainWindow):
             self._motor_busy -= 1
             for ch in chans:
                 try:
-                    self.dbg.write_reg(ch, REG_RTP, 0)
+                    self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
                     self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
                 except Exception:
                     pass
@@ -1336,16 +1491,16 @@ class DevTool(QMainWindow):
         w = self.rows[ch]
         power = w["power"].value()
         up, down = w["up"].value_ms(), w["down"].value_ms()
-        target = power * 255 // 100
+        target = pct_to_rtp(power)
         try:
             self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
             self.dbg.read_reg(ch, REG_STATUS)          # clear stale latch
-            self._ramp(ch, 0, target, up)
+            self._ramp(ch, RTP_ZERO, target, up)
             if on_ms > 0:
                 self.dbg.write_reg(ch, REG_RTP, target)
                 self._cycle_stop.wait(on_ms / 1000.0)  # interruptible hold
-            self._ramp(ch, target, 0, down)
-            self.dbg.write_reg(ch, REG_RTP, 0)
+            self._ramp(ch, target, RTP_ZERO, down)
+            self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
             self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
 
             st = self.dbg.read_reg(ch, REG_STATUS)
@@ -1402,7 +1557,9 @@ class DevTool(QMainWindow):
         lab.setStyleSheet(f"color:{color}; font-weight:500;")
 
     def _stop_all(self):
-        self._cycle_stop.set()
+        self._cycle_stop.set()          # always stop the cycle thread first
+        if not self.dbg.connected:
+            return
         def worker():
             for ch in range(NUM_CHANNELS):
                 self.dbg.stop_priority(ch)
@@ -1414,10 +1571,12 @@ class DevTool(QMainWindow):
 
     def closeEvent(self, e):
         self._save_settings()
+        self._link_timer.stop()
         try:
             self._stop_all()
         except Exception:
             pass
+        self.dbg.on_disconnect = None
         self.dbg.close()
         super().closeEvent(e)
 
