@@ -57,34 +57,6 @@ python userapp.py
 
 Устройство управляется из собственных программ через класс `GloveClient`. Все методы блокирующие, поэтому в приложениях с графическим интерфейсом их следует вызывать из рабочих потоков.
 
-```python
-import time
-from glove_client import GloveClient
-from models import Finger
-
-glove = GloveClient()
-
-try:
-    glove.connect(name="MCS Glove", timeout=10.0)
-    print(glove.device_info["model"], glove.device_info["fw_rev"])
-
-    batt = glove.battery_info()
-    print(f"Заряд {batt['percent']} %, {batt['voltage_mv']} мВ")
-
-    glove.vibration_on(Finger.INDEX, intensity_pct=70)
-    time.sleep(2.0)
-    glove.vibration_off(Finger.INDEX)
-
-    glove.tick(Finger.MIDDLE, effect_id=1)
-
-except (RuntimeError, ValueError) as e:
-    print(f"Ошибка: {e}")
-
-finally:
-    glove.all_off()
-    glove.close()
-```
-
 Полное описание методов, структур данных и устройства приложения пользователя приведено в руководстве прикладного программиста.
 
 ## Copyrights
