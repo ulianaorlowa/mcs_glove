@@ -25,6 +25,7 @@ from typing import Optional, Callable
 from bleak import BleakScanner, BleakClient
 
 DEBUG_UUID = "25b63a19-e70e-4040-bd91-85623b961384"
+HAPTIC_UUID = "8629d99b-e5c9-456c-9c40-e430c8da69d9"
 
 DIS_UUIDS = {
     "manufacturer": "00002a29-0000-1000-8000-00805f9b34fb",
@@ -34,6 +35,27 @@ DIS_UUIDS = {
     "serial":       "00002a25-0000-1000-8000-00805f9b34fb",
 }
 
+# ── RTP amplitude mapping ──────────────────────────────────────────────
+# Haptics_InitChannel() writes Control3 = 0xA8 on every channel:
+#   bit 5 ERM_OPEN_LOOP   = 1  → open loop
+#   bit 3 DATA_FORMAT_RTP = 1  → unsigned
+# In open loop the drive is bidirectional and referenced to OD_CLAMP:
+#   0x00 = -OD_CLAMP (full REVERSE drive)
+#   0x7F = zero drive
+#   0xFF = +OD_CLAMP (full forward drive)
+# So only the upper half 0x80..0xFF is usable, and writing 0 to REG_RTP
+# means MAXIMUM amplitude, not stop. Same convention as chip_write_rtp()
+# in glove_engine.c.
+RTP_ZERO  = 0x80
+RTP_FLOOR = 8          # smallest step that actually breaks the rotor loose
+
+def pct_to_rtp(pct: int) -> int:
+    """0-100 % → REG_RTP byte in the usable 0x80..0xFF half."""
+    pct = max(0, min(100, int(pct)))
+    if pct == 0:
+        return RTP_ZERO
+    span = pct * 127 // 100
+    return RTP_ZERO + max(span, RTP_FLOOR)
 
 class DebugClient:
     def __init__(self):
@@ -43,6 +65,7 @@ class DebugClient:
         self._client: Optional[BleakClient] = None
         self._lock = threading.Lock()          # serialise debug round trips
         self.on_status: Optional[Callable[[str], None]] = None
+        self.on_disconnect: Optional[Callable[[], None]] = None
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -54,6 +77,19 @@ class DebugClient:
     def _status(self, msg):
         (self.on_status or print)(msg)
 
+    def _handle_bleak_disconnect(self, client):
+        """Fired by bleak on its own loop when the link drops for ANY reason —
+        glove powered off with the button, out of range, stack error. Also
+        fires on a deliberate disconnect(), which is harmless: the app just
+        emits connected(False) twice."""
+        cb = self.on_disconnect
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    # ---- connection ----
     # ---- connection ----
     def connect(self, name="MCS Glove", timeout=10.0):
         return self._submit(self._connect(name, timeout)).result()
@@ -64,7 +100,7 @@ class DebugClient:
         if dev is None:
             raise RuntimeError(f"Device '{name}' not found")
         self._status(f"Connecting to {name}...")
-        self._client = BleakClient(dev)
+        self._client = BleakClient(dev, disconnected_callback=self._handle_bleak_disconnect)
         await self._client.connect()
         self._status("Connected.")
 
@@ -120,6 +156,19 @@ class DebugClient:
         r = self._round_trip([0x02, ch, reg, val, 0, 0, 0, 0], 0.06)
         return {"value": r[3], "ok": bool(r[5])}
 
+    async def _write_only(self, payload, response=True):
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        await self._client.write_gatt_char(DEBUG_UUID, bytes(payload),
+                                           response=response)
+
+    def write_reg_fast(self, ch, reg, val):
+        """Register write without the read-back round trip (~half the latency
+        of write_reg). Used for live amplitude updates. Returns nothing — use write_reg() when the
+        confirmation matters."""
+        with self._lock:                       # still serialised vs. battery polls
+            self._submit(self._write_only([0x02, ch, reg, val, 0, 0, 0, 0])).result()
+
     def run_mode(self, ch, mode, wait=2.5):
         r = self._round_trip([0x03, ch, 0x00, mode, 0, 0, 0, 0], wait)
         return {"status": r[3], "timed_out": bool(r[4]), "ok": bool(r[5])}
@@ -127,6 +176,12 @@ class DebugClient:
     def read_gauge(self, reg, wait=0.08):
         r = self._round_trip([0x04, 0, reg, 0, 0, 0, 0, 0], wait)
         return {"word": r[3] | (r[4] << 8), "ok": bool(r[5])}
+
+    async def _write_haptic(self, payload, response):
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        await self._client.write_gatt_char(HAPTIC_UUID, bytes(payload),
+                                           response=response)
     
     def stop_priority(self, ch):
         """Fire a standby write WITHOUT waiting for the command lock — used by
