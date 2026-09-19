@@ -42,11 +42,41 @@ Requires: pip install PySide6 bleak
 Run:      python userapp.py
 """
 
+# ---- crash logger: must stay above all other imports ----
+import os
+import sys
+from pathlib import Path
+
+
+def _install_crash_log() -> None:
+    """Write uncaught exceptions to %APPDATA%\\MCS Glove\\crash.log.
+    Needed for --windowed builds, which have no console to print to."""
+    log_dir = Path(os.environ.get("APPDATA") or Path.home()) / "MCS Glove"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "crash.log"
+
+    def _hook(exc_type, exc, tb):
+        import datetime
+        import traceback
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n=== {datetime.datetime.now()} ===\n")
+            traceback.print_exception(exc_type, exc, tb, file=f)
+        if sys.__stderr__ is not None:
+            sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+_install_crash_log()
+# ---- end crash logger ----
+
+import os
 import sys
 import json
 import time
 import threading
 from pathlib import Path
+
 
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QRectF, QPointF
 from PySide6.QtWidgets import (
@@ -95,7 +125,33 @@ SCENARIO_NAMES_RU: dict[str, str] = {
 
 MANUAL_MODE_NAME = "Свои настройки"
 
-USER_SCENARIOS_FILE = Path(__file__).with_name("user_scenarios.json")
+def resource_path(name: str) -> Path:
+    """Read-only asset shipped with the app. PyInstaller --onefile unpacks
+    bundled data to sys._MEIPASS at runtime; in a normal run that attribute
+    is absent and the file sits next to the script."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / name
+
+
+def data_dir() -> Path:
+    """Writable per-user location. Never write next to the exe: --onefile
+    unpacks to a temp dir that is wiped on exit, and Program Files is
+    read-only for a standard user."""
+    d = Path(os.environ.get("APPDATA") or Path.home()) / "MCS Glove"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+USER_SCENARIOS_FILE = data_dir() / "user_scenarios.json"
+
+# Controls stay locked until the glove is connected. Set to True only for UI
+# work without hardware — it re-enables the demo mode described in the module
+# docstring (the UI reacts, no BLE command leaves the app).
+ALLOW_OFFLINE_UI = False
+
+# Live amplitude: how much the slider must move before a BLE write is worth it,
+# and how often the scenario thread looks at the sliders.
+LIVE_MIN_DELTA = 3        # percent
+LIVE_POLL_S = 0.05        # 20 Hz ceiling on amplitude writes
 
 
 def finger_ru(f: Finger) -> str:
@@ -294,7 +350,7 @@ class Bridge(QObject):
     health       = Signal(int, str, str)        
     diag_result  = Signal(object, object)       
     motor_update = Signal()
-    run_end      = Signal()
+    run_end      = Signal(int)
 
 
 # ══════════════════════════════════════════════════════════
@@ -376,8 +432,9 @@ class ConnectionPanel(QGroupBox):
             except Exception as e:
                 self._bridge.status.emit(f"Ошибка подключения: {e}")
                 self._bridge.connected.emit(False)
-            finally:
-                self.btn_conn.setEnabled(True)
+            # The button is re-enabled in _on_connected_state, which Qt runs on
+            # the main thread. Calling setEnabled() from this worker thread is
+            # unsupported and eventually crashes the app.
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -389,6 +446,7 @@ class ConnectionPanel(QGroupBox):
         self._bridge.connected.emit(False)
 
     def _on_connected_state(self, ok: bool):
+        self.btn_conn.setEnabled(True)
         self._update_button_style(ok)
         self.status_label.setText("Подключено" if ok else "Не подключено")
         self.status_label.setStyleSheet(
@@ -498,6 +556,7 @@ class HandWidget(QGroupBox):
     """Hand. Choosing a finger by clicking on it. Sliding bar next to it"""
 
     selection_changed = Signal()
+    power_changed = Signal(object, int)      # (Finger, percent) — fires during drag
 
     def __init__(self, channels: dict[Finger, ChannelInfo], parent=None):
         super().__init__("", parent)
@@ -511,6 +570,8 @@ class HandWidget(QGroupBox):
         self.sliders: dict[Finger, FingerSlider] = {}
         for f in ALL_FINGERS:
             fs = FingerSlider(f, self)
+            fs.slider.valueChanged.connect(
+                lambda v, _f=f: self.power_changed.emit(_f, v))
             self.sliders[f] = fs
 
         self._update_slider_enabled()
@@ -519,7 +580,7 @@ class HandWidget(QGroupBox):
     @staticmethod
     def _load_hand() -> QPixmap:
         """hand.png loading"""
-        pm = QPixmap(str(Path(__file__).with_name("hand.png")))
+        pm = QPixmap(str(resource_path("hand.png")))
         if pm.isNull():
             return pm
         tinted = QPixmap(pm.size())
@@ -564,6 +625,12 @@ class HandWidget(QGroupBox):
     def _update_slider_enabled(self):
         for f, fs in self.sliders.items():
             fs.slider.setEnabled(self._selected[f])
+
+    def refresh_slider_enabled(self):
+        """Public hook. Qt re-enables children when the parent is re-enabled,
+        so after the hand is unlocked the per-finger sliders must be brought
+        back in line with the current selection."""
+        self._update_slider_enabled()
 
     # geometry
     def _hand_rect(self) -> QRectF:
@@ -619,6 +686,8 @@ class HandWidget(QGroupBox):
 
     # clicks
     def mousePressEvent(self, event):
+        if not self.isEnabled():        # Qt already filters this; explicit is safer
+            return
         rect = self._hand_rect()
         pos = event.position()
         rel_x = (pos.x() - rect.x()) / rect.width()
@@ -637,6 +706,12 @@ class HandWidget(QGroupBox):
         super().paintEvent(event)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # A disabled widget still paints itself. Without dimming, the hand looks
+        # exactly as it does when live and the patient keeps tapping it.
+        locked = not self.isEnabled()
+        if locked:
+            p.setOpacity(0.35)
 
         rect = self._hand_rect()
 
@@ -677,6 +752,14 @@ class HandWidget(QGroupBox):
                        Qt.AlignmentFlag.AlignCenter, str(f.value + 1))
             # The digit is the FINGER number shown to the patient (1..5), not
             # the DRV2605L channel. Finger-to-channel mapping is FINGER_CHANNEL.
+
+        if locked:
+            p.setOpacity(1.0)
+            p.setPen(QPen(QColor("#8A8A93")))
+            p.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+            p.drawText(QRectF(0, self.height() - 34, self.width(), 28),
+                       Qt.AlignmentFlag.AlignCenter,
+                       "Подключите перчатку, чтобы начать")
 
         p.end()
 
@@ -1009,7 +1092,6 @@ class ScenarioPanel(QGroupBox):
 #   _adv        — advanced per-channel settings from ChannelSettingsDialog
 #   _running    — "session in progress"; the worker thread polls this flag and
 #                 stops itself (cooperative stop, no thread is ever killed)
-#   _deadline   — wall-clock time at which the session must end
 
 class MotorControlApp(QMainWindow):
     def __init__(self):
@@ -1020,7 +1102,7 @@ class MotorControlApp(QMainWindow):
         self._glove = GloveClient()
         self._demo_mode = True
         self._running = False
-        self._deadline = 0.0
+        self._run_gen = 0
         self._applying_cfg = False     # True while a scenario is being loaded.
                                        # Without it, set_selected() inside
                                        # _apply_config would fire
@@ -1028,6 +1110,12 @@ class MotorControlApp(QMainWindow):
                                        # immediately reset the selection back
                                        # to "Свои настройки".
 
+                # Last slider value per finger, written by the GUI thread, read by the
+        # scenario thread. A plain dict is enough: int assignment is atomic, and
+        # the worker only ever needs the LATEST value, never the history.
+        self._live_power: dict[Finger, int] = {f: 60 for f in ALL_FINGERS}
+        self._live_gain = 60          # global slider = master gain for presets
+        
         self._channels: dict[Finger, ChannelInfo] = {
             f: ChannelInfo(finger=f, channel=FINGER_CHANNEL[f])
             for f in ALL_FINGERS
@@ -1042,7 +1130,8 @@ class MotorControlApp(QMainWindow):
         self._bridge = Bridge()
         self._glove.dbg.on_status = lambda msg: self._bridge.status.emit(msg)
         self._bridge.connected.connect(self._on_connected)
-        self._bridge.status.connect(self._on_status)
+        self._glove.dbg.on_status = lambda msg: self._bridge.status.emit(msg)
+        self._glove.dbg.on_disconnect = lambda: self._bridge.connected.emit(False)
         self._bridge.battery.connect(self._on_battery)
         self._bridge.health.connect(self._on_health)
         self._bridge.diag_result.connect(self._on_diag_result)
@@ -1056,9 +1145,10 @@ class MotorControlApp(QMainWindow):
         self._batt_timer.setInterval(5000)
         self._batt_timer.timeout.connect(self._poll_battery)
 
-        self._countdown_timer = QTimer(self)
-        self._countdown_timer.setInterval(200)
-        self._countdown_timer.timeout.connect(self._update_countdown)
+        self._link_timer = QTimer(self)
+        self._link_timer.setInterval(2000)
+        self._link_timer.timeout.connect(self._check_link)
+        self._link_timer.start()
 
         self._on_connected(False)
         self._on_battery({"percent": 0})
@@ -1070,6 +1160,9 @@ class MotorControlApp(QMainWindow):
         main_layout.setSpacing(8)
 
         top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(4, 4, 12, 4)
+        top_bar.setSpacing(10)
+
         top_bar.setContentsMargins(4, 4, 12, 4)
         top_bar.setSpacing(10)
 
@@ -1115,16 +1208,11 @@ class MotorControlApp(QMainWindow):
         self._scen_panel.user_scenario_selected.connect(self._apply_config)
         left.addWidget(self._scen_panel)
 
-        adv_box = QGroupBox("Доп. настройки")
+        self._adv_box = QGroupBox("Доп. настройки")
+        adv_box = self._adv_box
         adv_grid = QGridLayout(adv_box)
         adv_grid.setHorizontalSpacing(8)
         adv_grid.setVerticalSpacing(6)
-
-        adv_grid.addWidget(QLabel("Длительность сеанса, с"), 0, 0)
-        self._spin_session = QSpinBox()
-        self._spin_session.setRange(5, 3600)
-        self._spin_session.setValue(60)
-        adv_grid.addWidget(self._spin_session, 0, 1)
 
         adv_grid.addWidget(QLabel("Импульс, мс"), 1, 0)
         self._spin_pulse = QSpinBox()
@@ -1142,13 +1230,13 @@ class MotorControlApp(QMainWindow):
 
         left.addWidget(adv_box)
 
-        btn_diag = QPushButton("Диагностика")
-        btn_diag.clicked.connect(self._open_diagnostics)
-        left.addWidget(btn_diag)
+        self._btn_diag = QPushButton("Диагностика")
+        self._btn_diag.clicked.connect(self._open_diagnostics)
+        left.addWidget(self._btn_diag)
 
-        btn_ch = QPushButton("Настройки каналов")
-        btn_ch.clicked.connect(self._open_channel_settings)
-        left.addWidget(btn_ch)
+        self._btn_ch = QPushButton("Настройки каналов")
+        self._btn_ch.clicked.connect(self._open_channel_settings)
+        left.addWidget(self._btn_ch)
 
         left.addStretch()
         body.addLayout(left, stretch=2)
@@ -1158,6 +1246,7 @@ class MotorControlApp(QMainWindow):
 
         self._hand = HandWidget(self._channels)
         self._hand.selection_changed.connect(self._on_hand_selection)
+        self._hand.power_changed.connect(self._on_finger_power)
         right.addWidget(self._hand, stretch=1)
 
         right.addSpacing(14)          
@@ -1166,12 +1255,6 @@ class MotorControlApp(QMainWindow):
         run_row.setContentsMargins(0, 0, 0, 6)
 
         run_row.addStretch()
-
-        self._timer_lbl = QLabel("")
-        self._timer_lbl.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        self._timer_lbl.setStyleSheet("color: #2E2E33;")
-        run_row.addWidget(self._timer_lbl)
-        run_row.addSpacing(10)
 
         self._btn_run = QPushButton("Запуск")
         self._btn_run.setObjectName("run")
@@ -1185,8 +1268,20 @@ class MotorControlApp(QMainWindow):
 
         main_layout.addLayout(body, stretch=1)
 
+    def _on_finger_power(self, finger, percent: int):
+        """GUI thread. Only records the value. The scenario thread picks it up
+        on its next pass, which coalesces a fast drag into one BLE write instead
+        of one per pixel of travel."""
+        self._live_power[finger] = int(percent)
+
     def _on_global_power(self, v: int):
-        self._hand.set_all_power(v)
+        self._live_gain = v
+        self._hand.set_all_power(v)     # this re-emits power_changed per finger
+
+    def _scaled(self, intensity: int) -> int:
+        """Preset step intensity scaled by the global slider, so the patient can
+        turn a built-in scenario up or down while it plays."""
+        return max(0, min(100, intensity * self._live_gain // 100))
 
     def _on_select_all(self, checked: bool):
         self._hand.set_all_selected(checked)
@@ -1203,7 +1298,17 @@ class MotorControlApp(QMainWindow):
             self._scen_panel.clear_scenario()
 
     def _on_connected(self, ok: bool):
+        ok = bool(ok)
         self._demo_mode = not ok
+
+        if not ok and self._running:
+            # _demo_mode is already True here, so _stop_run() will not try to
+            # push all_off() down a link that no longer exists.
+            self._stop_run()
+            self._run_ended(self._run_gen)
+
+        self._set_controls_enabled(ok)
+
         if ok:
             self._batt_timer.start()
             self._poll_battery()
@@ -1211,10 +1316,29 @@ class MotorControlApp(QMainWindow):
             self._batt_timer.stop()
             self._on_battery({"percent": 0})
 
+    def _set_controls_enabled(self, ok: bool):
+        """Single place that decides what the patient may touch.
+        Everything here ends in a BLE command, so it is all locked until the
+        glove is actually connected."""
+        on = ok or ALLOW_OFFLINE_UI
+
+        self._hand.setEnabled(on)
+        self._hand.refresh_slider_enabled()   # unselected fingers stay locked
+        self._global_slider.setEnabled(on)
+        self._cb_all.setEnabled(on)
+        self._scen_panel.setEnabled(on)
+        self._adv_box.setEnabled(on)
+        self._btn_diag.setEnabled(on)
+        self._btn_ch.setEnabled(on)
+        self._btn_run.setEnabled(on)
+
     def _on_status(self, msg: str):
         self._conn_panel.status_label.setText(msg)
 
     def _open_diagnostics(self):
+        if not self._glove.connected and not ALLOW_OFFLINE_UI:
+            self._bridge.status.emit("Перчатка не подключена")
+            return
         self._diag_dialog = DiagnosticsDialog(
             self, self._bridge, self._glove, self._channels, self._demo_mode,
         )
@@ -1249,7 +1373,6 @@ class MotorControlApp(QMainWindow):
                     "power": self._hand.power(f),
                 } for f in ALL_FINGERS
             },
-            "session_s": self._spin_session.value(),
             "pulse_ms": self._spin_pulse.value(),
             "pause_ms": self._spin_pause.value(),
         }
@@ -1263,7 +1386,6 @@ class MotorControlApp(QMainWindow):
                     continue
                 self._hand.set_selected(f, bool(fc.get("selected", True)))
                 self._hand.set_power(f, int(fc.get("power", 60)))
-            self._spin_session.setValue(int(cfg.get("session_s", 60)))
             self._spin_pulse.setValue(int(cfg.get("pulse_ms", 500)))
             self._spin_pause.setValue(int(cfg.get("pause_ms", 200)))
         finally:
@@ -1304,7 +1426,17 @@ class MotorControlApp(QMainWindow):
         else:
             self._start_run()
 
+    def _alive(self, gen: int) -> bool:
+        """True while this worker is still the current run. """
+        return self._running and gen == self._run_gen
+
     def _start_run(self):
+        # Second line of defence: the link can drop between the click and this
+        # call, and ALLOW_OFFLINE_UI must never put commands on the air.
+        if not self._glove.connected and not ALLOW_OFFLINE_UI:
+            self._bridge.status.emit("Перчатка не подключена")
+            return
+
         kind, payload = self._scen_panel.selection()
 
         if kind == "user":
@@ -1316,8 +1448,12 @@ class MotorControlApp(QMainWindow):
                 self._bridge.status.emit("Не выбран ни один палец")
                 return
 
+        self._run_gen += 1
+        gen = self._run_gen
         self._running = True
-        self._deadline = time.time() + self._spin_session.value()
+        self._btn_run.setText("Стоп")
+
+        self._running = True
         self._btn_run.setText("Стоп")
         self._btn_run.setObjectName("stopAll")
         self._btn_run.setStyleSheet("")       # Qt caches the resolved style, so
@@ -1325,18 +1461,18 @@ class MotorControlApp(QMainWindow):
         self._btn_run.style().polish(self._btn_run)     # objectName it must be
                                                         # unpolished/repolished
                                                         # or the button stays green
-        self._countdown_timer.start()
-        self._update_countdown()
 
         if kind == "preset":
             scenario = PRESETS[payload]
-            worker = lambda: self._play_preset(scenario)
+            worker = lambda: self._play_preset(scenario, gen)
+
         else:
             fingers = self._hand.selected_fingers()
-            powers = {f: self._hand.power(f) for f in fingers}
+            for f in ALL_FINGERS:                     # re-sync before the run
+                self._live_power[f] = self._hand.power(f)
             pulse_s = self._spin_pulse.value() / 1000.0
             pause_s = self._spin_pause.value() / 1000.0
-            worker = lambda: self._play_manual(fingers, powers, pulse_s, pause_s)
+            worker = lambda: self._play_manual(fingers, pulse_s, pause_s, gen)
 
         def run():
             try:
@@ -1344,24 +1480,27 @@ class MotorControlApp(QMainWindow):
             except Exception as e:
                 self._bridge.status.emit(f"Ошибка сценария: {e}")
             finally:
-                self._bridge.run_end.emit()
+                self._bridge.run_end.emit(gen)
 
         threading.Thread(target=run, daemon=True).start()
 
     def _stop_run(self):
-        """Cooperative stop: only clear the flag. The scenario thread notices it
-        within 100 ms, finishes, and emits run_end itself. all_off() is sent in
-        parallel so the motors go quiet immediately rather than at the next
-        loop iteration."""
-
+        """Cooperative stop: clear the flag, silence the motors immediately,
+        and lock the button until the worker confirms it ended. Without the
+        lock a second click lands while _running is already False and starts
+        a brand-new run — which is what made Stop look unreliable."""
+        if not self._running:
+            return
         self._running = False
+        self._btn_run.setEnabled(False)
         if not self._demo_mode:
             threading.Thread(target=self._glove.all_off, daemon=True).start()
 
-    def _run_ended(self):
+    def _run_ended(self, gen: int):
+        if gen != self._run_gen:
+            return                      # a superseded worker finishing late
         self._running = False
-        self._countdown_timer.stop()
-        self._timer_lbl.setText("")
+        self._btn_run.setEnabled(True)
         self._btn_run.setText("Запуск")
         self._btn_run.setObjectName("run")
         self._btn_run.setStyleSheet("")
@@ -1372,23 +1511,19 @@ class MotorControlApp(QMainWindow):
                 self._channels[f].state = FingerState.IDLE
         self._refresh_hand()
 
-    def _update_countdown(self):
-        remaining = max(0, int(self._deadline - time.time() + 0.5))
-        self._timer_lbl.setText(f"{remaining // 60}:{remaining % 60:02d}")
-
     def _sleep_run(self, seconds: float) -> bool:
-        """Sleep in 100 ms slices, checking the stop flag and the deadline.
-        A single time.sleep() for the full step would make the Stop button
-        unresponsive — the session would keep running until the step ended.
+        """Sleep in 100 ms slices, checking the stop flag. A single
+        time.sleep() for the full step would make the Stop button
+        unresponsive — the step would run to completion regardless.
         -> True if the session may continue."""
         end = time.time() + seconds
         while time.time() < end:
-            if not self._running or time.time() >= self._deadline:
+            if not self._running:
                 return False
             time.sleep(min(0.1, end - time.time()))
-        return self._running and time.time() < self._deadline
+        return self._running
 
-    def _play_manual(self, fingers, powers, pulse_s, pause_s):
+    def _play_manual(self, fingers, pulse_s, pause_s, gen: int):
         vib = [f for f in fingers if self._adv[f]["mode"] == MotorMode.VIBRATION]
         tick = [f for f in fingers if self._adv[f]["mode"] == MotorMode.TICK]
 
@@ -1396,44 +1531,86 @@ class MotorControlApp(QMainWindow):
             self._channels[f].state = FingerState.ACTIVE
         if not self._demo_mode:
             for f in vib:
-                self._glove.vibration_on(f, powers[f])
+                self._glove.vibration_on(f, self._live_power[f])
             for f in tick:
                 self._glove.tick(f, self._adv[f]["effect_id"])
         self._bridge.motor_update.emit()
+
+        # Last value actually put on the air, per channel. Without it every loop
+        # pass would re-send the same amplitude 20 times a second.
+        sent = {f: self._live_power[f] for f in vib}
 
         # DRV2605L library effects are one-shot: the driver plays the click and
         # stops. To keep clicks going for the whole session they have to be
         # re-triggered manually every (pulse + pause) ms.
         tick_interval = pulse_s + pause_s
-        tick_interval = pulse_s + pause_s
         last_tick = time.time()
-        while self._running and time.time() < self._deadline:
-            time.sleep(0.1)
+
+        while self._running:
+            time.sleep(LIVE_POLL_S)
+
+            if not self._demo_mode:
+                for f in vib:
+                    want = self._live_power[f]
+                    if abs(want - sent[f]) >= LIVE_MIN_DELTA:
+                        try:
+                            self._glove.set_power(f, want)
+                            sent[f] = want
+                        except Exception as e:
+                            self._bridge.status.emit(f"Не удалось изменить силу: {e}")
+
             if tick and not self._demo_mode and \
                     time.time() - last_tick >= tick_interval:
                 for f in tick:
                     self._glove.tick(f, self._adv[f]["effect_id"])
                 last_tick = time.time()
 
-        if not self._demo_mode:
+        if not self._demo_mode and gen == self._run_gen:
             self._glove.all_off()
 
-    def _play_preset(self, scenario: Scenario):
-        while self._running and time.time() < self._deadline:
+    def _sleep_live(self, seconds: float, fingers, intensity: int, gen: int) -> bool:
+        """_sleep_run() that also keeps pushing the current master gain to the
+        channels vibrating in this step, so the global slider works mid-step.
+        -> True if the session may continue."""
+        end = time.time() + seconds
+        sent = {f: self._scaled(intensity) for f in fingers}
+        while time.time() < end:
+            if not self._alive(gen):
+                return False
+            time.sleep(min(LIVE_POLL_S, max(0.0, end - time.time())))
+            if self._demo_mode:
+                continue
+            want = self._scaled(intensity)
+            for f in fingers:
+                if abs(want - sent[f]) >= LIVE_MIN_DELTA:
+                    try:
+                        self._glove.set_power(f, want)
+                        sent[f] = want
+                    except Exception:
+                        pass
+        return self._alive(gen)
+
+    def _play_preset(self, scenario: Scenario, gen: int):
+        while self._alive(gen):
             for step in scenario.steps:
-                if not self._running or time.time() >= self._deadline:
+                if not self._alive(gen):
                     break
 
+                live = []          # channels in RTP this step — they can be retuned
                 for f in step.fingers:
                     self._channels[f].state = FingerState.ACTIVE
                     if not self._demo_mode:
                         if step.mode == MotorMode.VIBRATION:
-                            self._glove.vibration_on(f, step.intensity)
+                            self._glove.vibration_on(f, self._scaled(step.intensity))
+                            live.append(f)
                         else:
                             self._glove.tick(f, step.effect_id)
+                    elif step.mode == MotorMode.VIBRATION:
+                        live.append(f)
                 self._bridge.motor_update.emit()
 
-                self._sleep_run(step.duration_ms / 1000.0)
+                cont = self._sleep_live(step.duration_ms / 1000.0, live,
+                                        step.intensity, gen)
 
                 for f in step.fingers:
                     if not self._demo_mode:
@@ -1441,12 +1618,13 @@ class MotorControlApp(QMainWindow):
                     if self._channels[f].state == FingerState.ACTIVE:
                         self._channels[f].state = FingerState.IDLE
                 self._bridge.motor_update.emit()
-                time.sleep(0.05)
+                if not cont:
+                    break
 
             if not scenario.loop:
                 break
 
-        if not self._demo_mode:
+        if not self._demo_mode and gen == self._run_gen:
             self._glove.all_off()
 
     def _on_health(self, finger_int: int, text: str, color: str):
@@ -1466,6 +1644,12 @@ class MotorControlApp(QMainWindow):
             except Exception:
                 pass
         threading.Thread(target=worker, daemon=True).start()
+
+    def _check_link(self):
+        """bleak's disconnect callback is the primary detector; this catches
+        the backends where it doesn't fire. Cheap: reads a cached flag."""
+        if not self._demo_mode and not self._glove.connected:
+            self._bridge.connected.emit(False)
 
     def _on_battery(self, info: dict):
         self._batt_widget.setChargePercent(info.get("percent", 0))
