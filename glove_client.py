@@ -6,7 +6,7 @@ All public methods are BLOCKING (call from worker threads, not GUI thread).
 import time
 from typing import Optional, Callable
 
-from devclient import DebugClient
+from devclient import DebugClient, RTP_ZERO, pct_to_rtp
 from models import Finger, FINGER_CHANNEL
 
 NUM_CHANNELS = 8   
@@ -26,8 +26,6 @@ MODE_DIAG     = 0x06
 MODE_STANDBY  = 0x40
 
 DEFAULT_LIBRARY = 2          # Library B — same as devtool
-EFFECT_MIN = 1               # ROM library effect numbers, per DRV2605L datasheet
-EFFECT_MAX = 123        
 
 # MAX17055 fuel gauge registers
 GAUGE_VCELL   = 0x09
@@ -70,29 +68,33 @@ class GloveClient:
     def vibration_on(self, finger: Finger, intensity_pct: int = 60):
         """Start continuous vibration.  intensity_pct 0-100."""
         ch = FINGER_CHANNEL[finger]
-        target = max(0, min(255, intensity_pct * 255 // 100))
-        self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
-        self.dbg.read_reg(ch, REG_STATUS)          # clear stale latches
-        self.dbg.write_reg(ch, REG_RTP, target)
+        target = pct_to_rtp(intensity_pct)
+        self.dbg.write_reg_fast(ch, REG_MODE, MODE_RTP)
+        ##self.dbg.read_reg(ch, REG_STATUS)          # clear stale latches
+        self.dbg.write_reg_fast(ch, REG_RTP, target)
+
+    def set_power(self, finger, percent: int):
+        """Change the amplitude of an ALREADY RUNNING channel.
+        Only REG_RTP is written — MODE stays MODE_RTP, so the motor changes
+        level without stopping or re-ramping."""
+        ch = FINGER_CHANNEL[finger]
+        self.dbg.write_reg_fast(ch, REG_RTP, pct_to_rtp(percent))
 
     def vibration_off(self, finger: Finger):
         ch = FINGER_CHANNEL[finger]
-        self.dbg.write_reg(ch, REG_RTP, 0)
-        self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
+        self.dbg.write_reg_fast(ch, REG_RTP, RTP_ZERO)
+        self.dbg.write_reg_fast(ch, REG_MODE, MODE_STANDBY)
 
     def all_off(self):
-        """Emergency/normal stop — every hardware channel"""
-        for ch in range(NUM_CHANNELS):
+        """Emergency/normal stop — all 5 motor channels."""
+        for f in Finger:
+            ch = FINGER_CHANNEL[f]
             self.dbg.stop_priority(ch)
 
     # ── motor: tick (ROM library effect) ──────────────────
 
     def tick(self, finger: Finger, effect_id: int = 1):
         """Play a single ROM library effect, blocks ~0.5 s."""
-        if not EFFECT_MIN <= effect_id <= EFFECT_MAX:
-            raise ValueError(
-                f"effect_id must be {EFFECT_MIN}..{EFFECT_MAX}, got {effect_id}"
-            )
         ch = FINGER_CHANNEL[finger]
         self.dbg.write_reg(ch, REG_MODE, MODE_INTERNAL)
         self.dbg.write_reg(ch, REG_LIBRARY, DEFAULT_LIBRARY)
@@ -131,9 +133,9 @@ class GloveClient:
         # 2) short vibration burst so user can feel it
         if not problems:
             self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
-            self.dbg.write_reg(ch, REG_RTP, 0x50)      # ~30% intensity
+            self.dbg.write_reg(ch, REG_RTP, pct_to_rtp(30))
             time.sleep(0.8)
-            self.dbg.write_reg(ch, REG_RTP, 0)
+            self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
         self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
 
         return {
