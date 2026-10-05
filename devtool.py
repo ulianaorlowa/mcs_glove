@@ -114,7 +114,7 @@ QPushButton { background:#FFFFFF; border:1px solid #D8D6CC; border-radius:8px; p
 QPushButton:hover { background:#F1EFE8; }
 QPushButton:disabled { color:#B4B2A9; border-color:#E4E2DA; }
 QPushButton#run { background:#2AA67B; color:#FFFFFF; border:none; }
-QPushButton#run:hover { background:#24906A; }
+QPushButton#run:disabled { background:#D6CFCB; color:#F3F1EC; }
 QPushButton#stopAll {
     background:#A32D2D; color:#FFFFFF; border:none; border-radius:8px;
     font-size:17px; font-weight:600; letter-spacing:1px;
@@ -346,74 +346,162 @@ class EffectListDialog(QDialog):
         layout.addWidget(table)
         self.setFocus()   # allow closing with Esc
 
+class DiagBridge(QObject):
+    row  = Signal(int, object)          # ch, result dict
+    done = Signal()
+
+
 class DiagnosticsDialog(QDialog):
+    """Active per-channel DRV2605L check (mode 0x06 + GO via run_mode()).
+    Health is judged ONLY from the STATUS byte the firmware reads once after
+    GO self-clears (glove_debug_iface.c, opcode 0x03).
+    NOTE: on uncalibrated channels mode 6 can report DIAG_RESULT=1 even with
+    a motor connected — see the calibration test before trusting bit 3."""
+    COLS = ["Канал", "DEVICE_ID", "STATUS", "MODE", "LIBRARY", "RTP",
+            "Диагностика", "Проблемы", "Статус"]
+    DEVID_NAMES = {3: "DRV2605", 4: "DRV2604", 6: "DRV2604L", 7: "DRV2605L"}
+
     def __init__(self, parent, dbg):
         super().__init__(parent)
         self.dbg = dbg
+        self._stop = threading.Event()
+        self._worker = None
         self.setWindowTitle("Диагностика DRV2605L — Все 8 каналов")
         self.resize(1150, 680)
+
+        self.bridge = DiagBridge(self)
+        self.bridge.row.connect(self._fill_row)
+        self.bridge.done.connect(self._on_done)
 
         layout = QVBoxLayout(self)
 
         toolbar = QHBoxLayout()
-        refresh_btn = QPushButton("Обновить все")
-        refresh_btn.clicked.connect(self._refresh_all)
-        
+        self.refresh_btn = QPushButton("Запустить диагностику")
+        self.refresh_btn.clicked.connect(self._refresh_all)
         dump_btn = QPushButton("Полный дамп выбранного канала")
         dump_btn.clicked.connect(self._show_full_dump)
-        
-        toolbar.addWidget(refresh_btn)
+        toolbar.addWidget(self.refresh_btn)
         toolbar.addWidget(dump_btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
-        self.table = QTableWidget(8, 9, self)
-        headers = ["Канал", "DEVICE_ID", "STATUS", "MODE", "LIBRARY", "RTP", "Диагностика", "Проблемы", "Статус"]
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.info = QLabel("")
+        layout.addWidget(self.info)
+
+        self.table = QTableWidget(NUM_CHANNELS, len(self.COLS), self)
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Stretch)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeToContents)   # full problem text
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for ch in range(NUM_CHANNELS):
+            self.table.setItem(ch, 0, QTableWidgetItem(f"CH{ch}"))
         layout.addWidget(self.table)
 
         self._refresh_all()
 
-    def _read_reg(self, ch, reg):
+    # ---- worker thread ----
+    def _read(self, ch, reg):
         try:
             r = self.dbg.read_reg(ch, reg)
             return r["value"] if r["ok"] else None
-        except:
+        except Exception:
             return None
 
+    def _run_all(self):
+        for ch in range(NUM_CHANNELS):
+            if self._stop.is_set():
+                break
+            res = {
+                "mode": self._read(ch, REG_MODE),
+                "lib":  self._read(ch, REG_LIBRARY),
+                "rtp":  self._read(ch, REG_RTP),
+                "status": None, "comm_ok": False,
+                "timed_out": False, "error": None,
+            }
+            try:
+                r = self.dbg.run_mode(ch, MODE_DIAG, wait=2.0)
+                res["comm_ok"] = r["ok"]
+                res["timed_out"] = r["timed_out"]
+                if r["ok"]:
+                    res["status"] = r["status"]
+            except Exception as e:
+                res["error"] = str(e)
+            try:
+                self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
+            except Exception:
+                pass
+            try:
+                self.bridge.row.emit(ch, res)
+            except RuntimeError:            # dialog already destroyed
+                return
+        try:
+            self.bridge.done.emit()
+        except RuntimeError:
+            pass
+
+    # ---- GUI thread ----
     def _refresh_all(self):
-        for ch in range(8):
-            status = self._read_reg(ch, 0x00)
-            mode   = self._read_reg(ch, 0x01)
-            lib    = self._read_reg(ch, 0x03)
-            rtp    = self._read_reg(ch, 0x02)
+        if self._worker and self._worker.is_alive():
+            return
+        self._stop.clear()
+        self.refresh_btn.setEnabled(False)
+        for ch in range(NUM_CHANNELS):
+            for col in range(1, len(self.COLS)):
+                self.table.setItem(ch, col, QTableWidgetItem(""))
+            self.table.setItem(ch, 8, QTableWidgetItem("…"))
+        self.info.setText("Диагностика выполняется — моторы кратко сработают по очереди")
+        self._worker = threading.Thread(target=self._run_all, daemon=True)
+        self._worker.start()
 
-            devid = "??"
-            if status is not None:
-                devid_val = (status >> 5) & 0x07
-                names = {3:"DRV2605", 7:"DRV2605L", 4:"DRV2604", 6:"DRV2604L"}
-                devid = names.get(devid_val, f"0x{devid_val:02X}")
+    def _fill_row(self, ch, res):
+        hx = lambda v: f"0x{v:02X}" if v is not None else "—"
+        st = res["status"]
+        devid = "??"
+        problems = []
 
-            problems = []
-            if status is not None:
-                if status & 0x01: problems.append("OC/Нет мотора")
-                if (status >> 1) & 0x01: problems.append("Перегрев")
-                if (status >> 3) & 0x01: problems.append("Ошибка калибровки")
+        if res["error"]:
+            problems.append(f"ошибка BLE: {res['error']}")
+        elif not res["comm_ok"]:
+            problems.append("нет ответа по I2C")
+        elif res["timed_out"]:
+            problems.append("тайм-аут: GO не сбросился, результат недостоверен")
+        else:
+            devid_val = (st >> 5) & 0x07
+            devid = self.DEVID_NAMES.get(devid_val, f"ID {devid_val}")
+            if (st >> 3) & 1:
+                problems.append("отключён или КЗ")
+            if (st >> 1) & 1:
+                problems.append("перегрев")
+            if st & 1:
+                problems.append("перегрузка по току (КЗ)")
 
-            status_str = f"0x{status:02X}" if status is not None else "—"
+        valid = st is not None and not res["timed_out"] and not res["error"]
+        diag_txt = ("не выполнена" if not valid
+                    else ("Проблема" if (st >> 3) & 1 else "OK"))
 
-            self.table.setItem(ch, 0, QTableWidgetItem(f"CH{ch}"))
-            self.table.setItem(ch, 1, QTableWidgetItem(devid))
-            self.table.setItem(ch, 2, QTableWidgetItem(status_str))
-            self.table.setItem(ch, 3, QTableWidgetItem(f"0x{mode:02X}" if mode is not None else "—"))
-            self.table.setItem(ch, 4, QTableWidgetItem(f"0x{lib:02X}" if lib is not None else "—"))
-            self.table.setItem(ch, 5, QTableWidgetItem(f"0x{rtp:02X}" if rtp is not None else "—"))
-            self.table.setItem(ch, 6, QTableWidgetItem("Проблема" if problems else "OK"))
-            self.table.setItem(ch, 7, QTableWidgetItem(", ".join(problems) if problems else "—"))
-            self.table.setItem(ch, 8, QTableWidgetItem("ПРОБЛЕМА" if problems else "OK"))
+        prob_item = QTableWidgetItem(", ".join(problems) if problems else "—")
+        prob_item.setToolTip(prob_item.text())
+
+        self.table.setItem(ch, 1, QTableWidgetItem(devid))
+        self.table.setItem(ch, 2, QTableWidgetItem(hx(st)))
+        self.table.setItem(ch, 3, QTableWidgetItem(hx(res["mode"])))
+        self.table.setItem(ch, 4, QTableWidgetItem(hx(res["lib"])))
+        self.table.setItem(ch, 5, QTableWidgetItem(hx(res["rtp"])))
+        self.table.setItem(ch, 6, QTableWidgetItem(diag_txt))
+        self.table.setItem(ch, 7, prob_item)
+        verdict = QTableWidgetItem("ПРОБЛЕМА" if problems else "OK")
+        verdict.setForeground(QColor(RED if problems else GREEN))
+        self.table.setItem(ch, 8, verdict)
+
+    def _on_done(self):
+        self.refresh_btn.setEnabled(True)
+        self.info.setText("Готово. STATUS — значение, прочитанное после завершения диагностики (GO = 0).")
+
+    def reject(self):
+        self._stop.set()
+        super().reject()
 
     def _show_full_dump(self):
         row = self.table.currentRow()
@@ -585,6 +673,7 @@ class Bridge(QObject):
     battery = Signal(object)
     devinfo = Signal(object)
     cycle_done = Signal()
+    run_done = Signal(int)          
 
 class OtaBridge(QObject):
     log      = Signal(str)
@@ -875,6 +964,7 @@ class DevTool(QMainWindow):
         self.bridge.status.connect(self._log)
         self.bridge.connected.connect(self._on_connected)
         self.bridge.health.connect(self._set_health)
+        self.bridge.run_done.connect(lambda c: self.rows[c]["run"].setEnabled(True))
         self.bridge.battery.connect(self._update_battery)
         self.bridge.devinfo.connect(self._show_devinfo)
         self.bridge.cycle_done.connect(self._cycle_finished)
@@ -951,6 +1041,10 @@ class DevTool(QMainWindow):
         self.load_btn.clicked.connect(self._load_settings)
         self.reset_btn = QPushButton("Сбросить к базовым")
         self.reset_btn.clicked.connect(self._reset_to_defaults)
+        self.open_scen_btn = QPushButton("Открыть сценарий…")
+        self.open_scen_btn.clicked.connect(self._open_scenario_file)
+        self.save_scen_btn = QPushButton("Сохранить сценарий…")
+        self.save_scen_btn.clicked.connect(self._save_scenario_file)
         self.diag_btn = QPushButton("Диагностика драйверов")
         self.diag_btn.clicked.connect(self._open_diagnostics)
         # Offline reference table — no BLE traffic, stays available always.
@@ -962,6 +1056,16 @@ class DevTool(QMainWindow):
         controls_row.addStretch()
         controls_row.addWidget(effects_btn)
         left.addLayout(controls_row)
+
+        # Row 1b — scenario files
+        scen_row = QHBoxLayout()
+        scen_lab = QLabel("Сценарий:")
+        scen_lab.setStyleSheet("color:#6B6A63;")
+        scen_row.addWidget(scen_lab)
+        scen_row.addWidget(self.open_scen_btn)
+        scen_row.addWidget(self.save_scen_btn)
+        scen_row.addStretch()
+        left.addLayout(scen_row)
 
         # Row 2 — cycling
         cycle_row = QHBoxLayout()
@@ -980,6 +1084,16 @@ class DevTool(QMainWindow):
             cycle_row.addWidget(b)
         cycle_row.addStretch()
         left.addLayout(cycle_row)
+
+        legend = QLabel(
+            "<span style='color:#B4B2A9;'>■</span> Серый статус — результат "
+            "обычного запуска (RTP / библиотека), отсутствие мотора "
+            " или КЗ может не определиться. Для проверки запустите "
+            "«Диагностику».")
+        legend.setTextFormat(Qt.RichText)
+        legend.setWordWrap(True)
+        legend.setStyleSheet("color:#6B6A63;")
+        left.addWidget(legend)
 
         box = QGroupBox("Моторы")
         grid = QGridLayout(box)
@@ -1197,6 +1311,7 @@ class DevTool(QMainWindow):
 
         # --- everything that generates BLE traffic ---
         for btn in (self.stop_all_btn, self.run_sel_btn, self.load_btn,
+                    self.open_scen_btn, self.save_scen_btn,
                     self.reset_btn, self.diag_btn, self.cycle_start_btn,
                     self.cyc_set_btn, self.apply_all_btn, self.apply_sel_btn):
             btn.setEnabled(ok)
@@ -1286,7 +1401,7 @@ class DevTool(QMainWindow):
                     pass
             finally:
                 self._motor_busy -= 1
-                self.rows[ch]["run"].setEnabled(True)
+                self.bridge.run_done.emit(ch)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1294,10 +1409,9 @@ class DevTool(QMainWindow):
         w = self.rows[ch]
         power, dur, up, down = (w["power"].value(), w["dur"].value_ms(),
                                 w["up"].value_ms(), w["down"].value_ms())
-        self._log(f"CH{ch} ({designator(ch)}): RTP {power}% {dur} мс")
+        self.bridge.status.emit(f"CH{ch} ({designator(ch)}): RTP {power}% {dur} мс")
         target = pct_to_rtp(power)
         self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
-        self.dbg.read_reg(ch, REG_STATUS)              # clear stale latch
         self._ramp(ch, RTP_ZERO, target, up)
         if dur > 0:
             target = self._hold_live(ch, target, dur)
@@ -1309,11 +1423,10 @@ class DevTool(QMainWindow):
     def _do_library(self, ch):
         w = self.rows[ch]
         effect = w["eff"].value()
-        self._log(f"CH{ch} ({designator(ch)}): эффект №{effect} ({DEFAULT_LIBRARY_NAME})")
+        self.bridge.status.emit(f"CH{ch} ({designator(ch)}): эффект №{effect} ({DEFAULT_LIBRARY_NAME})")
 
         self.dbg.write_reg(ch, REG_MODE, MODE_INTERNAL)
         self.dbg.write_reg(ch, REG_LIBRARY, DEFAULT_LIBRARY_VAL)
-        self.dbg.read_reg(ch, REG_STATUS)
         self.dbg.write_reg(ch, REG_WAVE1, effect)
         self.dbg.write_reg(ch, REG_WAVE2, 0x00)
         self.dbg.write_reg(ch, REG_GO, 0x01)
@@ -1354,14 +1467,22 @@ class DevTool(QMainWindow):
                   "версию ПО в строке устройства.")
 
     def _do_mode(self, ch, mode, name):
-        self._log(f"CH{ch} ({designator(ch)}): {name}...")
+        self.bridge.status.emit(f"CH{ch} ({designator(ch)}): {name}...")
         r = self.dbg.run_mode(ch, mode, wait=2.0)
+        st = r["status"]
         if not r["ok"]:
             self.bridge.health.emit(ch, "нет связи с драйвером", RED, -1)
-        elif ((r["status"] >> 3) & 1) == 0:
-            self.bridge.health.emit(ch, f"{name} OK", GREEN, r["status"])
+        elif r["timed_out"]:
+            self.bridge.health.emit(ch, f"{name}: тайм-аут, результат недостоверен", RED, st)
+        elif (st >> 3) & 1:
+            why = "отключён или КЗ" if mode == MODE_DIAG else "калибровка не сошлась"
+            self.bridge.health.emit(ch, f"{name}: {why}", RED, st)
+        elif st & 1:
+            self.bridge.health.emit(ch, f"{name}: перегрузка по току (КЗ)", RED, st)
+        elif (st >> 1) & 1:
+            self.bridge.health.emit(ch, f"{name}: перегрев", RED, st)
         else:
-            self.bridge.health.emit(ch, f"{name}: ошибка", RED, r["status"])
+            self.bridge.health.emit(ch, f"{name} OK", GREEN, st)
         self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
 
     def _ramp(self, ch, start, end, ms):
@@ -1494,7 +1615,6 @@ class DevTool(QMainWindow):
         target = pct_to_rtp(power)
         try:
             self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
-            self.dbg.read_reg(ch, REG_STATUS)          # clear stale latch
             self._ramp(ch, RTP_ZERO, target, up)
             if on_ms > 0:
                 self.dbg.write_reg(ch, REG_RTP, target)
@@ -1522,8 +1642,9 @@ class DevTool(QMainWindow):
         return (f"{n} · работа {p['on']} мс · пауза {p['pause']} мс · "
                 f"лимит {p['limit']} мин · охлаждение {p['cool']} мин")
 
-    # ---- health ----
     def _emit_run_health(self, ch, st):
+        """After an RTP/library run the chip only reports short / overheat.
+        An open (unplugged) motor is not visible here — use Диагностика."""
         if not st["ok"]:
             self.bridge.health.emit(ch, "нет связи с драйвером", RED, -1)
             return
@@ -1531,9 +1652,27 @@ class DevTool(QMainWindow):
         if (v >> 1) & 1:
             self.bridge.health.emit(ch, "перегрев драйвера", RED, v)
         elif v & 1:
-            self.bridge.health.emit(ch, "не подключено или неисправен", RED, v)
+            self.bridge.health.emit(ch, "перегрузка по току (КЗ)", RED, v)
         else:
-            self.bridge.health.emit(ch, "OK", GREEN, v)
+            self.bridge.health.emit(ch, "без КЗ/перегрева (обрыв не проверялся)", GREY, v)
+
+    def _emit_run_health(self, ch, st):
+        """Health after a normal RTP/library run — shown GREY.
+        A run only reveals what the chip latched while driving: OC_DETECT
+        (no motor or short) and OVER_TEMP. It is not a verdict — that comes
+        from Диагностика / Автокалибр. (green / red, see _do_mode()).
+        Exceptions kept RED: no I2C answer, and overheat (a definite fault,
+        and the cycle stops on it)."""
+        if not st["ok"]:
+            self.bridge.health.emit(ch, "нет связи с драйвером", RED, -1)
+            return
+        v = st["value"]
+        if (v >> 1) & 1:
+            self.bridge.health.emit(ch, "перегрев драйвера", RED, v)
+        elif v & 1:
+            self.bridge.health.emit(ch, "после запуска: нет мотора или КЗ?", GREY, v)
+        else:
+            self.bridge.health.emit(ch, "запуск выполнен", GREY, v)
 
     def _status_detail(self, value):
         devid = (value >> 5) & 0x07
@@ -1542,11 +1681,11 @@ class DevTool(QMainWindow):
         return "\n".join([
             f"STATUS = 0x{value:02X}",
             f"  DEVICE_ID [7:5] = {devid} ({names.get(devid, '?')})",
-            f"  DIAG_RESULT [3] = {diag} ({'пройдена' if diag == 0 else 'ошибка'})",
+            f"  DIAG_RESULT [3] = {diag} ({'норма' if diag == 0 else 'отключён/КЗ или ошибка калибровки'})"
+            f" — валиден только после диагностики/калибровки, сбрасывается при чтении",
             f"  OVER_TEMP [1]   = {otemp} ({'норма' if otemp == 0 else 'перегрев'})",
-            f"  OC_DETECT [0]   = {oc} ({'норма' if oc == 0 else 'не подключено или неисправен'})",
+            f"  OC_DETECT [0]   = {oc} ({'норма' if oc == 0 else 'нет мотора или КЗ'})",
         ])
-
     def _set_health(self, ch, text, color, raw):
         lab = self.rows[ch]["health"]
         if raw < 0:
@@ -1604,55 +1743,113 @@ class DevTool(QMainWindow):
                   f"({len(chans)}): {mode}, {self.all_power.value()}%, "
                   f"{self.all_dur.value_ms()} мс")
 
+    def _collect_settings(self) -> dict:
+        data = {}
+        for ch in range(NUM_CHANNELS):
+            w = self.rows[ch]
+            data[str(ch)] = {
+                "mode":  w["mode"].currentText(),
+                "power": w["power"].value(),
+                "dur":   w["dur"].value_ms(),
+                "up":    w["up"].value_ms(),
+                "down":  w["down"].value_ms(),
+                "eff":   w["eff"].value(),
+            }
+        data["cycle"] = dict(self.cyc_params)
+        return data
+
+    def _apply_settings(self, data: dict) -> int:
+        """Put a settings dict into the table. Returns how many channels were
+        applied. Non-channel keys are skipped, missing fields use defaults."""
+        n = 0
+        for key, c in data.items():
+            if not str(key).isdigit() or not isinstance(c, dict):
+                continue
+            ch = int(key)
+            if ch not in self.rows:
+                continue
+            w = self.rows[ch]
+            idx = w["mode"].findText(str(c.get("mode", M_RTP)))
+            if idx >= 0:
+                w["mode"].setCurrentIndex(idx)
+            w["power"].setValue(int(c.get("power", 60)))
+            w["dur"].set_ms(int(c.get("dur", 500)))
+            w["up"].set_ms(int(c.get("up", 150)))
+            w["down"].set_ms(int(c.get("down", 200)))
+            w["eff"].setValue(int(c.get("eff", 1)))
+            self._mode_changed(ch)
+            n += 1
+
+        cyc = data.get("cycle")
+        if isinstance(cyc, dict):
+            for k, default in self.cyc_params.items():
+                if k in cyc:
+                    self.cyc_params[k] = (bool(cyc[k]) if isinstance(default, bool)
+                                          else int(cyc[k]))
+        return n
+
     def _save_settings(self):
-        """Save current UI parameters to file"""
+        """Save current parameters to the last-settings file (on exit)."""
         try:
-            settings = {}
-            for ch in range(NUM_CHANNELS):
-                w = self.rows[ch]
-                settings[ch] = {
-                    "mode": w["mode"].currentText(),
-                    "power": w["power"].value(),
-                    "dur": w["dur"].value_ms(),
-                    "up": w["up"].value_ms(),
-                    "down": w["down"].value_ms(),
-                    "eff": w["eff"].value(),
-                }
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2)
+            Path(SETTINGS_FILE).write_text(
+                json.dumps(self._collect_settings(), ensure_ascii=False, indent=2),
+                encoding="utf-8")
         except Exception as e:
             self._log(f"Не удалось сохранить настройки: {e}")
 
     def _load_settings(self):
-        """Load last used parameters"""
+        """Load the parameters saved on the last exit."""
         if not os.path.exists(SETTINGS_FILE):
             self._log("Файл настроек не найден — используются значения по умолчанию")
             return
-
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-
-            for ch_str, data in settings.items():
-                ch = int(ch_str)
-                if ch not in self.rows:
-                    continue
-                w = self.rows[ch]
-                try:
-                    idx = w["mode"].findText(data["mode"])
-                    if idx >= 0:
-                        w["mode"].setCurrentIndex(idx)
-                    w["power"].setValue(data.get("power", 60))
-                    w["dur"].set_ms(data.get("dur", 500))
-                    w["up"].set_ms(data.get("up", 150))
-                    w["down"].set_ms(data.get("down", 200))
-                    w["eff"].setValue(data.get("eff", 1))
-                    self._mode_changed(ch)
-                except Exception:
-                    pass
+            data = json.loads(Path(SETTINGS_FILE).read_text(encoding="utf-8"))
+            self._apply_settings(data)
             self._log("Загружены последние параметры")
         except Exception as e:
             self._log(f"Ошибка загрузки настроек: {e}")
+
+    def _open_scenario_file(self):
+        if self._cycle_thread and self._cycle_thread.is_alive():
+            # _cycle_pulse() reads power/ramps live — loading now would change
+            # a running cycle mid-way.
+            self._log("Остановите цикл перед загрузкой сценария")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть сценарий", str(data_dir()),
+            "Сценарий (*.json);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("неверный формат файла")
+            n = self._apply_settings(data)
+        except Exception as e:
+            self._log(f"Ошибка загрузки сценария: {e}")
+            return
+        if n == 0:
+            self._log(f"{Path(path).name}: в файле нет параметров каналов")
+            return
+        self._log(f"Сценарий загружен: {Path(path).name} — каналов: {n} · "
+                  + self._cycle_desc())
+
+    def _save_scenario_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить сценарий", str(data_dir() / "сценарий.json"),
+            "Сценарий (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            Path(path).write_text(
+                json.dumps(self._collect_settings(), ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as e:
+            self._log(f"Ошибка сохранения сценария: {e}")
+            return
+        self._log(f"Сценарий сохранён: {path}")
 
     def _reset_to_defaults(self):
         """Reset all channels to basic parameters"""

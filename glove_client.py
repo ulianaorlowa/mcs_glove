@@ -109,41 +109,37 @@ class GloveClient:
 
     def diagnose_finger(self, finger: Finger) -> dict:
         """
-        Run DRV2605L diagnostics mode on one finger.
-        Returns dict with keys: ok (bool), detail (str), status_raw (int).
-        Also does a quick vibration burst so the user can physically confirm.
+        Run DRV2605L actuator diagnostics (MODE 0x06 + GO) on one finger.
+        Returns dict: ok (bool), detail (str), status_raw (int).
         """
         ch = FINGER_CHANNEL[finger]
 
-        # 1) DRV hardware diagnostics
         r = self.dbg.run_mode(ch, MODE_DIAG, wait=2.0)
         if not r["ok"]:
+            self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
             return {"ok": False, "detail": "I²C communication failed", "status_raw": -1}
+        if r["timed_out"]:
+            self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
+            return {"ok": False, "detail": "diagnostic timed out (result invalid)",
+                    "status_raw": r["status"]}
 
         status = r["status"]
-        diag_fail = bool((status >> 3) & 1)
-        overtemp  = bool((status >> 1) & 1)
-        oc_detect = bool(status & 1)
-
         problems = []
-        if diag_fail:  problems.append("calibration error")
-        if overtemp:   problems.append("overtemperature")
-        if oc_detect:  problems.append("overcurrent / no motor")
+        if (status >> 3) & 1: problems.append("motor not connected or shorted")
+        if (status >> 1) & 1: problems.append("overtemperature")
+        if status & 1:        problems.append("overcurrent / short circuit")
 
-        # 2) short vibration burst so user can feel it
-        if not problems:
+        if not problems:      # short burst so the user can feel it
             self.dbg.write_reg(ch, REG_MODE, MODE_RTP)
             self.dbg.write_reg(ch, REG_RTP, pct_to_rtp(30))
             time.sleep(0.8)
             self.dbg.write_reg(ch, REG_RTP, RTP_ZERO)
         self.dbg.write_reg(ch, REG_MODE, MODE_STANDBY)
 
-        return {
-            "ok": len(problems) == 0,
-            "detail": ", ".join(problems) if problems else "OK",
-            "status_raw": status,
-        }
-
+        return {"ok": not problems,
+                "detail": ", ".join(problems) if problems else "OK",
+                "status_raw": status}
+    
     # ── battery ───────────────────────────────────────────
 
     def battery_info(self) -> dict:
