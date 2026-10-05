@@ -85,11 +85,11 @@ class GloveClient:
         self.dbg.write_reg_fast(ch, REG_RTP, RTP_ZERO)
         self.dbg.write_reg_fast(ch, REG_MODE, MODE_STANDBY)
 
-    def all_off(self):
-        """Emergency/normal stop — all 5 motor channels."""
-        for f in Finger:
-            ch = FINGER_CHANNEL[f]
-            self.dbg.stop_priority(ch)
+def all_off(self):
+    """Emergency/normal stop — all 8 motor channels (0..7)."""
+    for ch in range(NUM_CHANNELS):     
+        self.dbg.stop_priority(ch)
+
 
     # ── motor: tick (ROM library effect) ──────────────────
 
